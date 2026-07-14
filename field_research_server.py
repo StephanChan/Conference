@@ -17,7 +17,7 @@ import os
 import html as html_mod
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import httpx
 from mcp.server import Server, NotificationOptions
@@ -45,7 +45,7 @@ _client = httpx.Client(
 )
 
 
-def _semantic_request(url: str, params: dict = None) -> dict | None:
+def _semantic_request(url: str, params: dict = None) -> Optional[dict]:
     """Make a request to Semantic Scholar with retry logic."""
     for attempt in range(MAX_RETRIES):
         try:
@@ -65,7 +65,7 @@ def _semantic_request(url: str, params: dict = None) -> dict | None:
 # ---------------------------------------------------------------------------
 # Core API functions
 # ---------------------------------------------------------------------------
-def search_author(name: str, affiliation: str = None) -> list[dict]:
+def search_author(name: str, affiliation: str = None) -> List[dict]:
     """Search for an author by name. Returns list of author matches."""
     params = {
         "query": name,
@@ -89,7 +89,7 @@ def search_author(name: str, affiliation: str = None) -> list[dict]:
     return results
 
 
-def get_author_details(author_id: str) -> dict | None:
+def get_author_details(author_id: str) -> Optional[dict]:
     """Get detailed info about an author."""
     fields = "authorId,name,affiliations,paperCount,citationCount,hIndex,homepage"
     return _semantic_request(
@@ -98,7 +98,7 @@ def get_author_details(author_id: str) -> dict | None:
     )
 
 
-def get_author_papers(author_id: str, year_min: int = None, year_max: int = None) -> list[dict]:
+def get_author_papers(author_id: str, year_min: int = None, year_max: int = None) -> List[dict]:
     """Get papers for an author, filtered by year range."""
     fields = (
         "paperId,title,year,authors,abstract,externalIds,url,venue,"
@@ -128,7 +128,7 @@ def get_author_papers(author_id: str, year_min: int = None, year_max: int = None
     return all_papers
 
 
-def get_paper_details(paper_id: str) -> dict | None:
+def get_paper_details(paper_id: str) -> Optional[dict]:
     """Get details including TLDR for a specific paper."""
     fields = (
         "paperId,title,year,authors,abstract,externalIds,url,venue,"
@@ -152,7 +152,7 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]
 
 
-def _get_paper_abstract_with_tldr(paper: dict) -> tuple[str, str | None]:
+def _get_paper_abstract_with_tldr(paper: dict) -> Tuple[str, Optional[str]]:
     """Get abstract from paper, with TLDR enhancement."""
     abstract = paper.get("abstract") or ""
     tldr_text = None
@@ -174,8 +174,8 @@ def _get_paper_abstract_with_tldr(paper: dict) -> tuple[str, str | None]:
     return abstract, tldr_text
 
 
-def _generate_paper_summary_sections(paper: dict) -> list[tuple[str, str]]:
-    """Generate a richer four-part paper narrative for the HTML report."""
+def _generate_paper_summary_sections(paper: dict) -> List[Tuple[str, str]]:
+    """Generate richer paper-summary paragraphs for the HTML report."""
     abstract, tldr = _get_paper_abstract_with_tldr(paper)
     title = paper.get("title", "Untitled")
     fields = paper.get("fieldsOfStudy", []) or []
@@ -185,70 +185,73 @@ def _generate_paper_summary_sections(paper: dict) -> list[tuple[str, str]]:
     citations = paper.get("citationCount", 0) or 0
 
     sentences = _split_sentences(abstract) if abstract else []
+    problem_keywords = re.compile(
+        r'\b(problem|challenge|gap|limitation|difficulty|need|issue|shortcoming|bottleneck|goal|objective)\b',
+        re.IGNORECASE,
+    )
     method_keywords = re.compile(
         r'\b(we propose|we introduce|we present|we develop|we design|we describe|we formulate|'
         r'our approach|our method|our framework|we address|we tackle|we study|we investigate|'
-        r'we use|we leverage|we introduce a|we build a|we construct)\b',
+        r'we use|we leverage|we introduce a|we build a|we construct|using|by using|based on)\b',
         re.IGNORECASE,
     )
     result_keywords = re.compile(
         r'\b(we show|we demonstrate|we find|we achieve|we obtain|we evaluate|we compare|'
         r'outperforms|achieves|demonstrate that|show that|results show|our experiments|'
-        r'we report|we observe)\b',
+        r'we report|we observe|improve|improves|performance|accuracy|outperform|significantly)\b',
         re.IGNORECASE,
     )
 
-    problem_sentences = []
-    method_sentences = []
-    result_sentences = []
+    problem_sentences = [s for s in sentences if problem_keywords.search(s)]
+    method_sentences = [s for s in sentences if method_keywords.search(s)]
+    result_sentences = [s for s in sentences if result_keywords.search(s)]
 
-    for index, sentence in enumerate(sentences):
-        lower_sent = sentence.lower()
-        if method_keywords.search(sentence):
-            method_sentences.append(sentence)
-        elif result_keywords.search(sentence):
-            result_sentences.append(sentence)
-        elif index < max(2, min(4, len(sentences) // 2)):
-            problem_sentences.append(sentence)
-        else:
-            result_sentences.append(sentence)
+    if not problem_sentences and sentences:
+        problem_sentences = [sentences[0]]
+    if not method_sentences and len(sentences) > 1:
+        method_sentences = [sentences[1]]
+    if not result_sentences and sentences:
+        result_sentences = [sentences[-1]]
 
-    problem = " ".join(problem_sentences[:2]) if problem_sentences else ""
-    methods = " ".join(method_sentences[:2]) if method_sentences else ""
-    results = " ".join(result_sentences[:2]) if result_sentences else ""
+    def _build_paragraph(primary_sentences: list[str], fallback: str, *, max_sentences: int = 2) -> str:
+        selected = [s.strip() for s in primary_sentences if s.strip()][:max_sentences]
+        if not selected:
+            return fallback
+        if len(selected) == 1 and len(selected[0]) < 120:
+            selected.append(fallback)
+        return " ".join(selected)
 
-    if not problem:
-        if tldr:
-            problem = (
-                f"This paper addresses an important problem in {field_text} and is summarized in the TL;DR as: {tldr}"
-            )
-        else:
-            problem = (
-                f"The work focuses on a meaningful challenge in {field_text}, particularly around {title.lower()}, "
-                f"and situates itself in the literature on {venue}."
-            )
-
-    if not methods:
-        methods = (
-            f"The authors develop and evaluate an approach for {field_text} by framing the study around a clear method, "
-            f"which is then tested in the context of {title.lower()} and published in {venue} ({year})."
-        )
-
-    if not results:
-        results = (
-            f"The reported findings indicate that the paper has attracted {citations} citations and is regarded as an influential "
-            f"contribution in {field_text}."
-        )
-
-    discussion = (
-        f"Taken together, the study contributes to {field_text} by clarifying the main question, demonstrating a credible method, "
-        f"and offering results that are relevant to future work in the same area."
+    problem = _build_paragraph(
+        problem_sentences,
+        (
+            f"This paper addresses a central challenge in {field_text} by examining {title.lower()} in a way that highlights "
+            f"why the problem matters and what remains unresolved in the current literature."
+        ),
+    )
+    methods = _build_paragraph(
+        method_sentences,
+        (
+            f"The authors develop a clear methodological approach for {field_text}, situating the work around {title.lower()} "
+            f"and describing how the study is designed and evaluated within {venue} ({year})."
+        ),
+    )
+    results = _build_paragraph(
+        result_sentences,
+        (
+            f"The reported findings suggest that the contribution is meaningful in {field_text}, with evidence that the work "
+            f"has attracted {citations} citations and is regarded as influential within the literature."
+        ),
     )
 
-    if tldr and len(tldr) > 20 and len(discussion) < 220:
+    if tldr and len(tldr) > 20:
         discussion = (
-            f"The broader significance of the paper is that it turns a complex issue in {field_text} into a practical and testable contribution, "
-            f"which is why the TL;DR emphasizes its relevance: {tldr}"
+            f"Taken together, this work helps transform a difficult question in {field_text} into a practical and testable contribution. "
+            f"Its broader significance is captured by the TL;DR: {tldr}"
+        )
+    else:
+        discussion = (
+            f"Taken together, the study contributes to {field_text} by clarifying the core problem, grounding the work in a credible method, "
+            f"and presenting results that are likely to shape future inquiry around {title.lower()}."
         )
 
     return [
@@ -262,7 +265,7 @@ def _generate_paper_summary_sections(paper: dict) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Key figures extraction - link to actual paper figures
 # ---------------------------------------------------------------------------
-def _get_figure_links(paper: dict) -> list[dict]:
+def _get_figure_links(paper: dict) -> List[dict]:
     """Get links to actual figures/paper pages where figures can be viewed."""
     links = []
     ext_ids = paper.get("externalIds") or {}
@@ -299,7 +302,7 @@ def _get_figure_links(paper: dict) -> list[dict]:
     return links
 
 
-def _extract_key_figures(paper: dict) -> list[dict]:
+def _extract_key_figures(paper: dict) -> List[dict]:
     """Extract a compact set of key metrics that can be visualized in the report."""
     citations = paper.get("citationCount", 0) or 0
     refs = paper.get("referenceCount", 0) or 0
@@ -336,7 +339,7 @@ def _extract_key_figures(paper: dict) -> list[dict]:
     return figures
 
 
-def _build_visual_figure_cards(paper: dict) -> list[dict]:
+def _build_visual_figure_cards(paper: dict) -> List[dict]:
     """Create simple inline SVG figures to give the paper a visual summary in the report."""
     citations = paper.get("citationCount", 0) or 0
     refs = paper.get("referenceCount", 0) or 0
@@ -372,7 +375,7 @@ def _build_visual_figure_cards(paper: dict) -> list[dict]:
     return cards
 
 
-def _extract_commercialization(papers: list[dict], author: dict) -> list[dict]:
+def _extract_commercialization(papers: List[dict], author: dict) -> List[dict]:
     """Try to extract commercialization info from paper metadata."""
     activities = []
     seen_dois = set()
@@ -414,7 +417,7 @@ def generate_html_report(
     researcher_name: str,
     field: str,
     author_details: dict,
-    papers: list[dict],
+    papers: List[dict],
 ) -> str:
     """Generate a beautiful HTML report of the researcher's work."""
     current_year = datetime.now().year
@@ -761,7 +764,7 @@ server = Server("field-research-skill")
 
 
 def _parse_prompt_args(text: str) -> dict:
-    """Parse slash-style prompts such as /research-researcher/Yann_LeCun/machine_learning/Meta."""
+    """Parse prompts such as /research-researcher/Weiyi_Song/Shandong_university/OCT or /research-researcher/Weiyi Song, Shandong University, OCT."""
     if not text:
         return {}
 
@@ -772,28 +775,43 @@ def _parse_prompt_args(text: str) -> dict:
     if not text:
         return {}
 
-    parts = [p for p in text.split("/") if p]
-    if len(parts) == 1:
-        parts = [p for p in text.split("-") if p]
-
-    if not parts:
-        return {}
-
     def _normalize(p: str) -> str:
         return p.replace("_", " ").strip()
 
-    if len(parts) >= 3:
-        researcher_name = _normalize(parts[0])
-        field = _normalize(parts[1])
-        affiliation = _normalize(parts[2])
-    elif len(parts) == 2:
-        researcher_name = _normalize(parts[0])
-        field = _normalize(parts[1])
-        affiliation = None
+    if "," in text:
+        parts = [p for p in re.split(r"\s*,\s*", text) if p]
+        if len(parts) >= 3:
+            researcher_name = _normalize(parts[0])
+            affiliation = _normalize(parts[1])
+            field = _normalize(parts[2])
+        elif len(parts) == 2:
+            researcher_name = _normalize(parts[0])
+            affiliation = _normalize(parts[1])
+            field = None
+        else:
+            researcher_name = _normalize(parts[0])
+            affiliation = None
+            field = None
     else:
-        researcher_name = _normalize(parts[0])
-        field = None
-        affiliation = None
+        parts = [p for p in text.split("/") if p]
+        if len(parts) == 1:
+            parts = [p for p in text.split("-") if p]
+
+        if not parts:
+            return {}
+
+        if len(parts) >= 3:
+            researcher_name = _normalize(parts[0])
+            affiliation = _normalize(parts[1])
+            field = _normalize(parts[2])
+        elif len(parts) == 2:
+            researcher_name = _normalize(parts[0])
+            affiliation = _normalize(parts[1])
+            field = None
+        else:
+            researcher_name = _normalize(parts[0])
+            affiliation = None
+            field = None
 
     return {
         "researcher_name": researcher_name,
@@ -803,7 +821,7 @@ def _parse_prompt_args(text: str) -> dict:
 
 
 @server.list_tools()
-async def handle_list_tools() -> list[Tool]:
+async def handle_list_tools() -> List[Tool]:
     return [
         Tool(
             name="research_researcher",
@@ -836,7 +854,7 @@ async def handle_list_tools() -> list[Tool]:
 
 
 @server.call_tool()
-async def handle_call_tool(name: str, arguments: dict) -> list[TextContent | EmbeddedResource]:
+async def handle_call_tool(name: str, arguments: dict) -> List[TextContent]:
     if name != "research_researcher":
         raise ValueError(f"Unknown tool: {name}")
 
